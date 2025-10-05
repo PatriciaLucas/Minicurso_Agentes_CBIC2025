@@ -1,23 +1,19 @@
-from typing import Literal
 from dotenv import load_dotenv
-from typing import Annotated
 from typing_extensions import TypedDict
-from typing import List, Optional
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
+from typing import List
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, SystemMessage
 from langchain_community.document_loaders import UnstructuredURLLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import END, START, StateGraph, MessagesState
+from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_community.chat_models import ChatDeepInfra
 from langchain_community.embeddings import DeepInfraEmbeddings
-from langchain_experimental.agents.agent_toolkits import create_pandas_dataframe_agent
-from langgraph.graph.message import add_messages
-from langchain import hub
-from langchain.agents import create_react_agent, initialize_agent
-from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain.agents import initialize_agent
+from langchain_core.output_parsers import JsonOutputParser
+from langchain.prompts import ChatPromptTemplate
 import json
 import os
 import warnings
@@ -28,6 +24,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 # Defina sua chave de acesso 
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
+NASA_API_KEY = os.getenv("NASA_API_KEY")
 
 
 global retriever
@@ -36,15 +33,16 @@ def rag(documento):
     global retriever
 
     # Exemplo com URL
-    urls = [
-        documento
-    ]
+    urls = [documento]
+
     # Load documentos
     loader = UnstructuredURLLoader(urls=urls)
     docs = loader.load()
     
     # Split documentos
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=100, chunk_overlap=50)
+    text_splitter = RecursiveCharacterTextSplitter(separators = ["\n\n", "\n", ". ", ", ", " ", ""], 
+                                                   chunk_size=200, 
+                                                   chunk_overlap=20)
     doc_splits = text_splitter.split_documents(docs)
     
     # Create VectorStore
@@ -53,16 +51,18 @@ def rag(documento):
         collection_name="docs",
         embedding = DeepInfraEmbeddings(model_id="BAAI/bge-base-en-v1.5", deepinfra_api_token=API_KEY),
     )
-    retriever = vectorstore.as_retriever()
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+    
     return retriever
 
 
 # Tool para RAG
 @tool
 def retrieve_context(query: str):
-    """Search for relevant documents."""
+    """Pesquise notícias recentes sobre astronomia."""
     global retriever
     results = retriever.invoke(query)
+    print(results)
     return "\n".join([doc.page_content for doc in results])
 
 tools = [retrieve_context]
@@ -71,38 +71,34 @@ tools = [retrieve_context]
 model = ChatDeepInfra(
             model= "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
             temperature=0,
+            max_tokens = 256,
             deepinfra_api_token=API_KEY
         )
 
-agent_executor = initialize_agent(
+agent_assistente = initialize_agent(
     tools, 
     model,
     agent="zero-shot-react-description",  # usa ReAct pronto
     verbose=True
 )
 
-agent_avaliador = model
-
+agent_moderador = model
 
 
 class State(TypedDict):
-    messages: List[BaseMessage]
+    messages: List[BaseMessage] 
     documento: str
     avaliacao: str
     feedback: str
-    contador: int
 
 
-# Nó avaliador
-def avaliador(state: State):
-    contador = state["contador"]
-
-    last_ai_message = None
-    last_human_message = None
+# Nó moderador
+def moderador(state: State):
 
     # Pega a última mensagem AI. O caso 2 é para funcionar no langsmith.
+    last_ai_message = None
     for msg in reversed(state["messages"]):
-        # caso 1: já é HumanMessage
+        # caso 1: já é AIMessage
         if isinstance(msg, AIMessage):
             last_ai_message = msg.content
             break
@@ -123,60 +119,47 @@ def avaliador(state: State):
             last_human_message = msg.get("content")
             break
 
-    print(f"ultima msg usuário: {last_human_message}")
-    print(f"ultima msg ai: {last_ai_message}")
+    # Prompt template
+    parser = JsonOutputParser()
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "Você é um moderador de RESPOSTAS de um agente que só deve falar sobre o tema astronomia."),
+        ("human", 
+         """Dada a Pergunta e a Resposta, responda se a Resposta está adequada para a Pergunta.
+         Responda "sim" se a resposta estiver adequada e "não" se a resposta não estiver adequada.
+         
+         Se sua resposta for não, dê um feedback curto para que o agente assistente melhore sua resposta.
+         
+         Responda APENAS em JSON válido no formato:
+         {{"resposta": "sim", "feedback": "Você não possui feedback."}} 
+         ou 
+         {{"resposta": "não", "feedback": "Escreva seu feedback aqui"}}.
 
-    prompt_avaliador = f"""
-    Você é um avaliador pouco criterioso de RESPOSTAS de um agente que é assistente de astronomia.
-    Não seja muito rigoroso, o agente assistente não possui muitas fontes de consulta.
-    Dada a Pergunta e a Resposta, responda se a Resposta está adequada para a Pergunta.
-    Responda "sim" se a resposta estiver adequada e "não" se a resposta não estiver adequada.
- 
-    Se sua resposta for não, dê um feedback curto para que o agente assistente melhore sua resposta.
-    
-    Responda APENAS em JSON válido no formato:
-    {{"resposta": "sim", "feedback": "Você não possui feedback."}} 
-    ou 
-    {{"resposta": "não", "feedback": "Escreva seu feedback aqui"}}.
+         Pergunta: {pergunta}
+         Resposta: {resposta}"""
+        )
+    ])
 
-    Pergunta: {last_human_message}
-    Resposta: {last_ai_message}
-    """
-
-    messages = [HumanMessage(content=prompt_avaliador)]
-    response = agent_avaliador.invoke(messages)
-
+    chain = prompt | agent_moderador | parser
     try:
-        result = json.loads(response.content)
+        result = chain.invoke({"pergunta": last_human_message, "resposta": last_ai_message})
         resposta = result.get("resposta", "").strip()
         feedback = result.get("feedback", "").strip()
+
     except Exception as e:
         print("Erro ao interpretar resposta:", e)
         resposta = "sim"
         feedback = "Você não possui feedback."
 
-    if resposta == "não":
-        contador = state["contador"] + 1
+    print({"avaliacao": resposta,"feedback": feedback})
 
-    if contador > 5:
-        resposta = "sim"
-        feedback = "Você não possui feedback."
+    state["avaliacao"] = resposta
+    state["feedback"] = feedback
 
-    print({
-        "avaliacao": resposta,
-        "feedback": feedback,
-        "contador": contador
+    return state
 
-    })
-    return {
-        "avaliacao": resposta,
-        "feedback": feedback,
-        "contador": contador
-    }
-
-
-# Nó executor
-def executor(state: State):
+# Nó assitente
+def assistente(state: State):
+    global retriever
     retriever = rag(state["documento"])
     feedback = state.get("feedback", "")
 
@@ -192,7 +175,10 @@ def executor(state: State):
             last_human_message = msg.get("content")
             break
 
-    prompt_executor = f"""Você é um assistente de astronomia. 
+    prompt_system = f"""
+    Você é um assistente de astronomia super gentil que se comunica em português.
+    """
+    prompt_assistente = f""" 
     Responda a Pergunta usando a dica para formular melhor sua resposta.
 
     Pergunta: {last_human_message}
@@ -202,24 +188,21 @@ def executor(state: State):
     {{"resposta": "sua resposta aqui"}} 
 
     """
-    messages = [HumanMessage(content=prompt_executor)]
-    response = agent_executor.invoke(messages)
+    messages = [SystemMessage(content=prompt_system), HumanMessage(content=prompt_assistente)]
+    response = agent_assistente.invoke(messages)
     
     result = json.loads(response['output'])
-    # result = json.loads(response.content)
 
     resposta = result.get("resposta", "").strip()
 
-    new_messages = state["messages"] + [AIMessage(content=resposta)]
+    state["messages"] = state["messages"] + [AIMessage(content=resposta)]
 
-    return {
-        "messages": new_messages
-    }
+    return state
 
 
 # Nó roteador
 def roteador(state: State):
-    """Roteia para o agente_executor ou finaliza."""
+    """Roteia para o agente_assistente ou finaliza."""
     avaliacao = state.get("avaliacao")
     
     if avaliacao == 'não':
@@ -227,56 +210,47 @@ def roteador(state: State):
 
     return 'fim'
 
-
-# Nó que finaliza o workflow
-def finaliza(state: State):
-    """Finaliza o workflow e retorna a resposta do agente_executor"""
-    return {"messages": state['messages']}
-
-# Definindo o workflow
+# Definindo o grafo
 workflow = StateGraph(State)
 
 # Adicionando os nós
 tool_node = ToolNode(tools=tools)
-workflow.add_node("agent_executor", executor)
+workflow.add_node("assistente", assistente)
 workflow.add_node("tools", tool_node)
-workflow.add_node("agent_avaliador", avaliador)
-workflow.add_node("finaliza", finaliza)
+workflow.add_node("moderador", moderador)
 
 # Conectando os nós
-workflow.add_edge(START, "agent_executor")  
-workflow.add_conditional_edges("agent_executor", tools_condition)  
-workflow.add_edge("tools", "agent_executor")  
-workflow.add_edge("agent_executor", "agent_avaliador")
+workflow.add_edge(START, "assistente")  
+workflow.add_conditional_edges("assistente", tools_condition)  
+workflow.add_edge("tools", "assistente")  
+workflow.add_edge("assistente", "moderador")
 workflow.add_conditional_edges(
-    "agent_avaliador",
+    "moderador",
     roteador,
     {
-        "refazer": "agent_executor",
-        "fim": "finaliza"
+        "refazer": "assistente",
+        "fim": END
     }
 )
-workflow.add_edge("finaliza", END)
-
 
 # Para incluir memória inclua checkpointer no compile.
 checkpointer = MemorySaver()
-
-# No langsmith, não use o checkpointer, pois a própria ferramenta já salva o histórico.
-app = workflow.compile()
-
-# Sem o langsmith
 app = workflow.compile(checkpointer=checkpointer) 
 
-
-# Desabilite o app.invoke para executar com o langsmith
+# Execução 
 final_state = app.invoke(
-    {"messages": [HumanMessage(content="Olá! O que é o 3I/ATLAS?")],
-     "documento": 'https://science.nasa.gov/solar-system/comets/3i-atlas/',
-     "contador": 1
+    {"messages": [HumanMessage(content="Olá! Quais as novidades astronômicas de hoje?"),],
+        "documento": 'https://www.nasa.gov/news/recently-published/',
+        "avaliacao": "",
+        "feedback": ""
      },
     config={"configurable": {"api_key": API_KEY, "thread_id": 42}}
 )
 
-# Show the final response
+# Estado final do grafo
 print(final_state)
+
+
+# Visualize o grafo
+from IPython.display import Image, display
+display(Image(app.get_graph().draw_mermaid_png()))
