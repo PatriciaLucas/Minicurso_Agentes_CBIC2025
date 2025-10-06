@@ -8,7 +8,7 @@ Aqui você encontrará os códigos e slides utilizados na apresentação.
 
 ## 📘 Objetivo
 
-Apresentar de forma prática e acessível os principais conceitos e ferramentas para o **desenvolvimento de agentes inteligentes baseados em Large Language Models (LLMs)**, incluindo o uso das bibliotecas **LangChain** e **LangGraph**.
+Apresentar de forma prática e acessível os principais conceitos e ferramentas para o **desenvolvimento de agentes inteligentes baseados em Large Language Models (LLMs)** com as bibliotecas **LangChain** e **LangGraph**.
 
 ---
 
