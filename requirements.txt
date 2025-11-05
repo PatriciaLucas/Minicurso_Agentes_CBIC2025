@@ -4,11 +4,7 @@ langchain
 langchain_experimental
 python-dotenv
 ipykernel
-streamlit
-darts
-emd
 matplotlib
-statsmodels
 langgraph-cli
 langgraph-cli[inmem]
 unstructured
